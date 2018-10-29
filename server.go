@@ -6,8 +6,9 @@ import (
 	"net/http"
 	"sync"
 
+	"time"
+
 	"github.com/gorilla/websocket"
-	"github.com/satori/go.uuid"
 )
 
 type Message struct {
@@ -21,6 +22,7 @@ type SocketServer struct {
 	Register   chan *Client     //注册
 	UnRegister chan *Client     //卸载
 	Broadcast  chan []byte      //广播消息
+	mutex      sync.Mutex       //锁
 }
 
 var socketServer *SocketServer
@@ -43,6 +45,7 @@ type Client struct {
 	UserID  int             //用户ID
 	Socket  *websocket.Conn //Socket连接
 	Message chan []byte     //发送给Client的消息
+	Closed  bool            //是否关闭
 }
 
 func NewSocketServer() *SocketServer {
@@ -59,37 +62,30 @@ func (s *SocketServer) Start() {
 		select {
 		case c := <-s.Register:
 			s.Clients[c] = true
-			message, _ := json.Marshal(&Message{Content: "A new socket has connected."})
-			s.PushAllWithout(message, c)
 			go s.Read(c)
 			go s.Push(c)
+			//go s.Heartbeat(c)
+			fmt.Printf("Socket Client Register   ID:%s Total:%d\n", c.ID, len(s.Clients))
+
 		case c := <-s.UnRegister:
 			if _, ok := s.Clients[c]; ok {
-				c.Socket.Close()
-				delete(s.Clients, c)
-				message, _ := json.Marshal(&Message{Content: "A new socket has disconnected."})
-				s.PushAll(message)
+				s.Close(c)
+				fmt.Printf("Socket Client UnRegister ID:%s Total:%d\n", c.ID, len(s.Clients))
 			}
 		case message := <-s.Broadcast:
-			for c := range s.Clients {
-				select {
-				case c.Message <- message:
-					fmt.Printf("Broadcast\n")
-				default:
-					c.Socket.Close()
-					delete(s.Clients, c)
-					fmt.Printf("stop\n")
-				}
-			}
+			s.PushAll(message)
 		}
-		fmt.Printf("cnt=%d\n", len(s.Clients))
 	}
 }
 
 func (s *SocketServer) Close(c *Client) {
-	c.Socket.Close()
-	close(c.Message)
-	delete(s.Clients, c)
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if !c.Closed {
+		close(c.Message)
+		delete(s.Clients, c)
+		c.Closed = true
+	}
 }
 
 func (s *SocketServer) Read(c *Client) {
@@ -105,7 +101,7 @@ func (s *SocketServer) Read(c *Client) {
 			break
 		}
 		jsonMsg, _ := json.Marshal(&Message{Sender: c.ID, Content: string(message)})
-		s.Broadcast <- jsonMsg
+		c.Message <- jsonMsg
 	}
 }
 
@@ -115,7 +111,11 @@ func (s *SocketServer) Push(c *Client) {
 	}()
 	for {
 		select {
-		case message := <-c.Message:
+		case message, ok := <-c.Message:
+			if !ok {
+				c.Socket.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
 			c.Socket.WriteMessage(websocket.TextMessage, message)
 		}
 	}
@@ -123,13 +123,24 @@ func (s *SocketServer) Push(c *Client) {
 
 func (s *SocketServer) PushAll(message []byte) {
 	for c := range s.Clients {
-		c.Message <- message
-		s.Push(c)
+		select {
+		case c.Message <- message:
+		default:
+			s.Close(c)
+			fmt.Printf("Socket Client Close ID:%s Total:%d\n", c.ID, len(s.Clients))
+		}
 	}
 }
 
-func (s *SocketServer) Heartbeat() {
-
+func (s *SocketServer) Heartbeat(c *Client) {
+	for {
+		time.Sleep(2 * time.Second)
+		if err := c.Socket.WriteMessage(websocket.TextMessage, []byte("heartbeat from server")); err != nil {
+			fmt.Println("heartbeat fail")
+			s.Close(c)
+			break
+		}
+	}
 }
 
 func (s *SocketServer) GetConn(w http.ResponseWriter, r *http.Request) *websocket.Conn {
@@ -152,33 +163,4 @@ func (s *SocketServer) PushAllWithout(message []byte, ignore *Client) {
 		}
 		fmt.Printf("ID=%s, Message=%v\n", c.ID, c.Message)
 	}
-}
-
-func WSHandler(w http.ResponseWriter, r *http.Request) {
-	s := GetSocketServerInstance()
-	conn := s.GetConn(w, r)
-	c := &Client{ID: uuid.NewV4().String(), UserID: GetUserID(r), Socket: conn, Message: make(chan []byte)}
-	s.Register <- c
-}
-
-func GetUserID(r *http.Request) int {
-	return 0
-}
-
-func GetAuth(r *http.Request) bool {
-	return true
-}
-
-func PushHandler(w http.ResponseWriter, r *http.Request) {
-	s := GetSocketServerInstance()
-	s.Broadcast <- []byte(r.FormValue("user_id"))
-}
-
-func Run(addr, wspath, pushPath string) {
-	fmt.Println("Starting application...")
-	s := GetSocketServerInstance()
-	go s.Start()
-	http.HandleFunc(fmt.Sprintf("/%s", wspath), WSHandler)
-	http.HandleFunc(fmt.Sprintf("/%s", pushPath), PushHandler)
-	http.ListenAndServe(addr, nil)
 }
