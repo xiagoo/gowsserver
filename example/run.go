@@ -30,9 +30,7 @@ func WSHandler(w http.ResponseWriter, r *http.Request) {
 func PushHandler(w http.ResponseWriter, r *http.Request) {
 	s := gowsserver.GetSocketServerInstance()
 	for c := range s.Clients {
-		if c.UserID == 135246 {
-			c.Message <- []byte(fmt.Sprintf("test->user_id:%s", r.Header.Get("user_id")))
-		}
+		c.Message <- []byte(fmt.Sprintf("test->user_id:%s", r.Header.Get("user_id")))
 	}
 }
 
